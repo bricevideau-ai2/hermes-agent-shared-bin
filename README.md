@@ -19,6 +19,10 @@ gw-restart --list
 
 - **Target** is a numeric uid OR a Linux username (resolved to uid via `getent`;
   uid is the ground-truth contract).
+- **`--list`** enumerates agent homes via `sudo test -d $home/.hermes`, so it
+  works cross-uid (shows every agent, not just the caller's own). If sudo can't
+  run in the calling context, an account is silently skipped — target by explicit
+  uid/username, which never depends on the `--list` probe.
 - **Default mode `auto`** uses the guard-immune `sudo systemctl restart
   user@<uid>.service` lever — the ONLY one that works from inside a gateway
   process, because the lifecycle guard string-blocks any command containing the

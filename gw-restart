@@ -68,9 +68,13 @@ info() { echo "[$PROG] $*"; }
 
 list_agents() {
   echo "Candidate agent accounts (have ~/.hermes):"
+  # Probe ~/.hermes with `sudo test -d` so it works CROSS-UID (a caller can't
+  # stat into another agent's home unelevated). If sudo can't run here, the
+  # sudo test simply fails and that account is skipped — target by explicit
+  # uid/username instead, which never depends on this probe.
   while IFS=: read -r name _ uid _ _ home _; do
     [ "$uid" -ge 1000 ] 2>/dev/null || continue
-    [ -d "$home/.hermes" ] || continue
+    sudo test -d "$home/.hermes" 2>/dev/null || continue
     printf "  uid=%-6s user=%-14s home=%s\n" "$uid" "$name" "$home"
   done < <(getent passwd)
 }
