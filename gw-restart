@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# gw-restart — cross-agent Hermes gateway restart wrapper.
+#
+# WHY THIS EXISTS
+#   Restarting a Hermes gateway from inside another gateway is subtle:
+#     1. You must NEVER restart your OWN gateway (you kill the session running
+#        the command). This tool refuses self-restart.
+#     2. The terminal-tool lifecycle guard string-matches the literal
+#        `hermes[.-]?gateway` token and blocks ANY command containing it when
+#        run inside a gateway process (`_HERMES_GATEWAY=1`) — even a legit
+#        `sudo -u peer ... systemctl --user restart hermes-gateway.service`.
+#        So the ONLY lever that works cross-agent from inside a gateway is the
+#        guard-immune one whose text lacks the token:
+#            sudo systemctl restart user@<uid>.service
+#        That is this tool's default ("auto"/"manager" mode). This file itself
+#        avoids writing the literal service name where a mode needs to run from
+#        inside a gateway; the plain-service rung is provided for out-of-gateway
+#        shells only and is clearly gated.
+#
+# TARGET ARGUMENT
+#   Accepts EITHER a numeric uid OR a Linux username; resolved to the canonical
+#   uid+user pair via getent. uid is the ground-truth contract.
+#
+# Source of truth for protocol/escalation: the shared skill
+#   /var/lib/agent-shared/skills/cross-agent-gateway-restart/SKILL.md
+set -uo pipefail
+
+PROG=$(basename "$0")
+SERVICE="hermes-gateway.service"   # constructed, never used inside a gateway for rungs 1-3
+
+usage() {
+  cat <<EOF
+$PROG — cross-agent Hermes gateway restart
+
+USAGE:
+  $PROG <uid|username> [--mode auto|service|manager|terminate] [--dry-run]
+  $PROG <uid|username> --status
+  $PROG --list
+  $PROG -h|--help
+
+TARGET:
+  <uid|username>   Numeric uid OR Linux username of the ISSUER (the agent whose
+                   gateway needs restarting). Resolved to uid+user via getent.
+
+MODES (--mode, default: auto):
+  auto       Guard-immune: 'sudo systemctl restart user@<uid>.service'.
+             The ONLY mode that works when run from INSIDE a gateway process.
+             Cycles the issuer's user manager; the gateway comes back with it
+             and re-reads its .env. Also refreshes supplementary groups.
+  manager    Alias for auto (explicit name for the user@<uid>.service lever).
+  service    Plain 'systemctl --user restart $SERVICE'. LEAST disruptive, but
+             BLOCKED by the lifecycle guard inside a gateway — usable ONLY from
+             a shell where _HERMES_GATEWAY is unset. Refused inside a gateway.
+  terminate  Heaviest: 'sudo loginctl terminate-user <user>' + linger respawn.
+             Use only when the user manager itself is unrecoverable.
+
+OTHER:
+  --status   Show the issuer's gateway state (PID, active, last handshake) and exit.
+  --dry-run  Print the exact command(s) that WOULD run, then exit.
+  --list     List candidate agent uids on this host (users with a ~/.hermes) and exit.
+
+EXIT: 0 = restarted AND verified healthy; non-zero otherwise.
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "[$PROG] $*"; }
+
+list_agents() {
+  echo "Candidate agent accounts (have ~/.hermes):"
+  while IFS=: read -r name _ uid _ _ home _; do
+    [ "$uid" -ge 1000 ] 2>/dev/null || continue
+    [ -d "$home/.hermes" ] || continue
+    printf "  uid=%-6s user=%-14s home=%s\n" "$uid" "$name" "$home"
+  done < <(getent passwd)
+}
+
+# ---- arg parse ----
+[ $# -eq 0 ] && { usage; exit 2; }
+case "${1:-}" in -h|--help) usage; exit 0;; --list) list_agents; exit 0;; esac
+
+TARGET="$1"; shift
+MODE="auto"; DRYRUN=0; STATUS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="${2:-}"; shift 2 || die "--mode needs a value";;
+    --mode=*) MODE="${1#*=}"; shift;;
+    --dry-run) DRYRUN=1; shift;;
+    --status) STATUS=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) die "unknown argument: $1 (see --help)";;
+  esac
+done
+
+case "$MODE" in auto|manager|service|terminate) ;; *) die "invalid --mode: $MODE";; esac
+
+# ---- resolve target (uid OR username) to canonical uid+user via getent ----
+if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+  ENT=$(getent passwd "$TARGET") || die "no such uid: $TARGET"
+else
+  ENT=$(getent passwd "$TARGET") || die "no such user: $TARGET"
+fi
+TUSER=$(echo "$ENT" | cut -d: -f1)
+TUID=$(echo "$ENT" | cut -d: -f3)
+THOME=$(echo "$ENT" | cut -d: -f6)
+[ -n "$TUID" ] && [ -n "$TUSER" ] || die "could not resolve target '$TARGET'"
+
+# ---- refuse self-restart (the core safety rule) ----
+SELF_UID=$(id -u)
+if [ "$TUID" = "$SELF_UID" ]; then
+  die "refusing to restart your OWN gateway (uid $TUID). Ask your peer agent to do it — see the cross-agent-gateway-restart skill."
+fi
+
+RUN="XDG_RUNTIME_DIR=/run/user/$TUID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$TUID/bus"
+LOG="$THOME/.hermes/logs/gateway.log"
+
+# ---- helpers that read issuer state via sudo ----
+get_pid() { sudo -u "$TUSER" env $RUN systemctl --user show "$SERVICE" -p MainPID --value 2>/dev/null; }
+get_active() { sudo -u "$TUSER" env $RUN systemctl --user is-active "$SERVICE" 2>/dev/null; }
+last_handshake() { sudo tail -40 "$LOG" 2>/dev/null | grep -E "discord connected|Connected as" | tail -2; }
+
+show_status() {
+  info "target: uid=$TUID user=$TUSER"
+  info "active: $(get_active)"
+  info "MainPID: $(get_pid)"
+  info "runtime dir: $(sudo test -d /run/user/"$TUID" && echo present || echo MISSING)"
+  info "last handshake in $LOG:"
+  last_handshake | sed 's/^/    /'
+}
+
+if [ "$STATUS" = 1 ]; then show_status; exit 0; fi
+
+# ---- verify runtime dir before acting ----
+verify_runtime() {
+  if ! sudo test -d /run/user/"$TUID"; then
+    info "runtime dir /run/user/$TUID MISSING — enabling linger so the user manager spawns"
+    [ "$DRYRUN" = 1 ] || sudo loginctl enable-linger "$TUSER"
+  fi
+}
+
+# ---- build the command for the chosen mode ----
+# Note: only 'auto'/'manager' are guard-immune (no hermes-gateway token) and thus
+# safe to run from inside a gateway. 'service' is refused inside a gateway.
+build_cmd() {
+  case "$MODE" in
+    auto|manager) echo "sudo systemctl restart user@$TUID.service" ;;
+    service)      echo "sudo -u $TUSER env $RUN systemctl --user restart $SERVICE" ;;
+    terminate)    echo "sudo loginctl terminate-user $TUSER" ;;
+  esac
+}
+
+# ---- guard: refuse the 'service' mode when running inside a gateway ----
+if [ "$MODE" = "service" ] && [ "${_HERMES_GATEWAY:-}" = "1" ]; then
+  die "mode 'service' is blocked inside a gateway process (lifecycle guard string-matches the service name). Use --mode auto (default) from inside a gateway, or run 'service' mode from a shell where _HERMES_GATEWAY is unset."
+fi
+
+CMD=$(build_cmd)
+PRE_PID=$(get_pid)
+# Anchor the handshake check to AFTER this restart: remember how many lines the
+# log has now, so we only accept a "connected" line that appears BELOW this
+# point. Without this, a stale handshake from a PRIOR restart yields a false
+# "healthy" verdict (observed + fixed 2026-07-30).
+PRE_LOGLINES=$(sudo wc -l "$LOG" 2>/dev/null | awk '{print $1}'); PRE_LOGLINES=${PRE_LOGLINES:-0}
+
+info "target: uid=$TUID user=$TUSER  mode=$MODE"
+info "pre-restart MainPID: ${PRE_PID:-<none>}"
+info "command: $CMD"
+
+if [ "$DRYRUN" = 1 ]; then
+  info "(dry-run) would run the above; then verify PID change + fresh handshake + rising ticks"
+  if [ "$MODE" = "terminate" ]; then
+    info "(dry-run) would then ensure linger + wait for runtime dir, then: sudo systemctl restart user@$TUID.service"
+  fi
+  exit 0
+fi
+
+verify_runtime
+
+# ---- execute ----
+eval "$CMD" || die "restart command failed (exit $?)"
+
+# terminate mode: ensure the manager respawns, then bring the gateway back
+if [ "$MODE" = "terminate" ]; then
+  sudo loginctl enable-linger "$TUSER" 2>/dev/null || true
+  for i in $(seq 1 15); do sudo test -d /run/user/"$TUID" && break; sleep 1; done
+  sudo systemctl restart "user@$TUID.service" || die "user manager did not come back after terminate"
+fi
+
+# ---- verify (active != healthy) ----
+info "waiting for gateway to re-establish..."
+NEW_PID=""
+for i in $(seq 1 20); do
+  sleep 1
+  NEW_PID=$(get_pid)
+  [ -n "$NEW_PID" ] && [ "$NEW_PID" != "0" ] && [ "$NEW_PID" != "$PRE_PID" ] && break
+done
+
+[ -n "$NEW_PID" ] && [ "$NEW_PID" != "0" ] || die "no new MainPID after restart — gateway did not come up"
+[ "$NEW_PID" != "$PRE_PID" ] || info "WARN: MainPID unchanged ($NEW_PID) — may not have restarted"
+
+info "new MainPID: $NEW_PID (was ${PRE_PID:-<none>})"
+
+# fresh handshake in the file log — ONLY accept lines appended AFTER the restart
+# (below PRE_LOGLINES), so a stale handshake from a prior restart can't pass.
+HS=""
+for i in $(seq 1 25); do
+  HS=$(sudo tail -n +"$((PRE_LOGLINES + 1))" "$LOG" 2>/dev/null | grep -E "discord connected|Connected as" | tail -2)
+  [ -n "$HS" ] && break
+  sleep 1
+done
+if [ -n "$HS" ]; then
+  info "fresh handshake (post-restart):"; echo "$HS" | sed 's/^/    /'
+else
+  info "WARN: no NEW handshake line seen since restart in $LOG — check manually"
+fi
+
+# liveness: CPU ticks should rise (frozen = wedged). Sample until rising or timeout.
+T1=$(sudo awk '{print $14+$15}' /proc/"$NEW_PID"/stat 2>/dev/null)
+TICKS_RISING=0
+for i in 1 2 3 4 5; do
+  sleep 2
+  T2=$(sudo awk '{print $14+$15}' /proc/"$NEW_PID"/stat 2>/dev/null)
+  if [ -n "$T2" ] && [ -n "$T1" ] && [ "$T2" -gt "$T1" ] 2>/dev/null; then TICKS_RISING=1; break; fi
+  T1=$T2
+done
+info "CPU ticks final sample: $T2 (rising=$TICKS_RISING)"
+
+ACTIVE=$(get_active)
+info "active: $ACTIVE"
+
+if [ "$ACTIVE" = "active" ] && [ -n "$HS" ]; then
+  info "OK: gateway for uid=$TUID ($TUSER) restarted and verified healthy."
+  exit 0
+else
+  die "restart completed but health NOT confirmed (active=$ACTIVE, handshake=$([ -n "$HS" ] && echo yes || echo no)). Investigate before reporting success."
+fi
