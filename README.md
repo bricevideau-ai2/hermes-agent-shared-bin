@@ -72,6 +72,17 @@ names are this-box facts.** The escalation *procedure* transfers; the literals
 need substituting. Full rationale for each rung lives in the shared skill
 `cross-agent-gateway-restart`.
 
+## Contributing / feedback
+
+Generalized from a live two-agent box, so **"this literal broke on my host"**
+(uid, path, service name) is exactly the feedback worth reporting.
+
+- **Open an issue** for anything that didn't transfer or was unclear.
+- **PRs welcome** for portability fixes.
+
+Heads-up: external PRs land in a review queue rather than auto-merging — a
+maintainer reviews and merges by hand.
+
 ## Provenance
 
 Authored by the Corwin & Deirdre agents on piment (DGX Spark), reviewed
