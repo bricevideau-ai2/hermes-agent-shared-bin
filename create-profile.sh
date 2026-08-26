@@ -77,6 +77,9 @@ usage: $(basename "$0") <agent-name> <soul-file> [options]
 options:
   --uid <name>            unix account to host the profile   (default: $AGENT_UID_NAME)
   --description <text>    role blurb used by the kanban decomposer
+  --display-name <text>   override the label shown in \`hermes profile list\`.
+                          Not normally needed: <agent-name> IS the display
+                          name, and the lowercase id is derived from it.
   --model <name>          primary model                      (default: $PRIMARY_MODEL)
   --provider <name>       primary provider                   (default: $PRIMARY_PROVIDER)
   --vllm-url <url>        local OpenAI-compatible endpoint    (default: $VLLM_URL)
@@ -98,6 +101,8 @@ while [[ $# -gt 0 ]]; do
     --uid=*)           AGENT_UID_NAME="${1#*=}"; shift ;;
     --description)     DESCRIPTION="$2"; shift 2 ;;
     --description=*)   DESCRIPTION="${1#*=}"; shift ;;
+    --display-name)    DISPLAY_NAME="$2"; shift 2 ;;
+    --display-name=*)  DISPLAY_NAME="${1#*=}"; shift ;;
     --model)           PRIMARY_MODEL="$2"; shift 2 ;;
     --model=*)         PRIMARY_MODEL="${1#*=}"; shift ;;
     --provider)        PRIMARY_PROVIDER="$2"; shift 2 ;;
@@ -124,7 +129,9 @@ SOUL_FILE="${2:-}"
 [[ -n "$PROFILE"   ]] || { echo "error: <agent-name> is required" >&2; usage; exit 1; }
 [[ -n "$SOUL_FILE" ]] || { echo "error: <soul-file> is required (use '-' for stdin)" >&2; usage; exit 1; }
 
-# The profile name becomes a directory AND a Mnemosyne bank name.
+# The agent name is taken AS THE DISPLAY NAME, and the canonical profile id is
+# derived from it by normalization. Pass 'Deirdre' and you get display name
+# 'Deirdre' with id/dir/bank/unit all 'deirdre'.
 #
 # NORMALIZE, DON'T REJECT (aligned with Hermes 2026-08-26). Hermes itself
 # accepts mixed case and DOWNCASES it: hermes_cli/profiles.py
@@ -136,11 +143,11 @@ SOUL_FILE="${2:-}"
 # `hermes profile create` accepts. Measured: 'Testcap' -> 'testcap',
 # 'DEIRDRE' -> 'deirdre', '  Spaced  ' -> 'spaced'.
 #
-# We normalize the same way, then tell the user when the name changed, so the
-# soul says "Testcap" while the directory, bank, and systemd unit all agree on
-# "testcap" — silent divergence between what you typed and what exists on disk
-# is the actual failure mode here.
+# The normalization is announced when it changes the name, so the operator
+# always sees which id their label resolved to — silent divergence between the
+# label and the on-disk id is the actual failure mode here.
 AGENT_INPUT="$PROFILE"
+: "${DISPLAY_NAME:=}"
 PROFILE="$(printf '%s' "$PROFILE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 if [[ "$PROFILE" != "$AGENT_INPUT" ]]; then
   printf "  [note] agent name normalized: '%s' -> '%s' (Hermes stores profiles lowercase)\n" \
@@ -165,6 +172,21 @@ for _reserved in hermes default test tmp root sudo; do
     exit 1
   fi
 done
+
+# THE ARGUMENT IS THE DISPLAY NAME; the id is derived from it.
+#
+# Brice's framing, and it's the right one: don't ask for an id and try to
+# guess a pretty label from it. Take the name as typed, use it verbatim for
+# display, and NORMALIZE it to get the canonical id. One input, one derivation,
+# no second-guessing.
+#
+# An earlier draft capitalized the first letter when the operator typed all
+# lowercase. That is exactly the kind of cleverness that gets names wrong:
+# 'mcKay', 'aiPeer', or an acronym would be silently mangled, and the operator
+# would have no way to ask for a lowercase label. If you type it, you get it.
+if [[ -z "$DISPLAY_NAME" ]]; then
+  DISPLAY_NAME="$(printf '%s' "$AGENT_INPUT" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+fi
 
 # Derived shared paths (after --shared-root is known).
 : "${SHARED_SKILLS:=${SHARED_ROOT}/skills}"
@@ -273,6 +295,34 @@ else
     --no-skills --description "$DESCRIPTION" \
     >/dev/null 2>&1 || die "profile create failed"
   ok "created profile '$PROFILE'"
+fi
+
+# Display name — presentation-only, canonical id stays lowercase.
+#
+# Hermes stores profile ids lowercase, but renders `Display (id)` in
+# `profile list`, matching Corwin's `display_name: Corwin` in the root
+# profile.yaml. Without this an agent shows up as bare `benedict` while its
+# siblings show as `Corwin`. Defaults to the capitalized input the operator
+# typed (`create-profile.sh Testcap` -> id `testcap`, display `Testcap`);
+# override with --display-name.
+#
+# Deliberately NOT `hermes profile rename`: for a non-default profile that
+# verb MOVES THE DIRECTORY and stops the gateway, and would fail outright
+# here since the target dir already exists. set_profile_display_name() is
+# the presentation-only path, and write_profile_meta() merges — it preserves
+# the existing description instead of overwriting profile.yaml.
+if [[ $DRY_RUN -eq 1 ]]; then
+  printf '  [dry] set display_name=%s on profile %s\n' "$DISPLAY_NAME" "$PROFILE"
+else
+  if asagent env HERMES_HOME="$ROOT_HOME" "$PYBIN" -c "
+import sys; sys.path.insert(0, '${ROOT_HOME}/hermes-agent')
+from hermes_cli.profiles import set_profile_display_name
+set_profile_display_name('$PROFILE', '''$DISPLAY_NAME''')
+" >/dev/null 2>&1; then
+    ok "display name: '${DISPLAY_NAME}' (canonical id stays '${PROFILE}')"
+  else
+    warn "could not set display_name — profile will render as bare '${PROFILE}'"
+  fi
 fi
 
 # ---------------------------------------------------------------- phase 3
