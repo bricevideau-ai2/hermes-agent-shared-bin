@@ -124,14 +124,47 @@ SOUL_FILE="${2:-}"
 [[ -n "$PROFILE"   ]] || { echo "error: <agent-name> is required" >&2; usage; exit 1; }
 [[ -n "$SOUL_FILE" ]] || { echo "error: <soul-file> is required (use '-' for stdin)" >&2; usage; exit 1; }
 
-# The profile name becomes a directory AND a Mnemosyne bank name. Reject
-# anything the plugin would sanitize away (or that could traverse a path)
-# rather than silently provisioning an agent whose memory lands elsewhere.
-if ! [[ "$PROFILE" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
-  echo "error: agent name '$PROFILE' must match ^[a-z][a-z0-9_-]{0,63}$" >&2
-  echo "       (it becomes a directory and a Mnemosyne bank name)" >&2
+# The profile name becomes a directory AND a Mnemosyne bank name.
+#
+# NORMALIZE, DON'T REJECT (aligned with Hermes 2026-08-26). Hermes itself
+# accepts mixed case and DOWNCASES it: hermes_cli/profiles.py
+# normalize_profile_name() lowercases (and case-folds the `default` alias),
+# then validate_profile_name() checks the result against
+# ^[a-z0-9][a-z0-9_-]{0,63}$. Mnemosyne's _sanitize_bank_name() lowercases too.
+# An earlier version of this script rejected any uppercase name outright,
+# which was STRICTER THAN THE PLATFORM and would have refused a name that
+# `hermes profile create` accepts. Measured: 'Testcap' -> 'testcap',
+# 'DEIRDRE' -> 'deirdre', '  Spaced  ' -> 'spaced'.
+#
+# We normalize the same way, then tell the user when the name changed, so the
+# soul says "Testcap" while the directory, bank, and systemd unit all agree on
+# "testcap" — silent divergence between what you typed and what exists on disk
+# is the actual failure mode here.
+AGENT_INPUT="$PROFILE"
+PROFILE="$(printf '%s' "$PROFILE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+if [[ "$PROFILE" != "$AGENT_INPUT" ]]; then
+  printf "  [note] agent name normalized: '%s' -> '%s' (Hermes stores profiles lowercase)\n" \
+    "$AGENT_INPUT" "$PROFILE"
+fi
+
+# Leading DIGIT is legal in Hermes ([a-z0-9] start), so do not forbid it.
+if ! [[ "$PROFILE" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+  echo "error: agent name '$AGENT_INPUT' normalizes to '$PROFILE', which is not a valid" >&2
+  echo "       profile id. Must match ^[a-z0-9][a-z0-9_-]{0,63}\$ after lowercasing" >&2
+  echo "       (it becomes a directory, a Mnemosyne bank, and a systemd unit name)." >&2
   exit 1
 fi
+
+# Hermes refuses these outright (_RESERVED_NAMES in hermes_cli/profiles.py):
+# they collide with the install dir or a common system binary. 'default' is the
+# built-in root profile — provisioning it here would target the ROOT install,
+# not a sibling profile, which is exactly the accident this script guards.
+for _reserved in hermes default test tmp root sudo; do
+  if [[ "$PROFILE" == "$_reserved" ]]; then
+    echo "error: agent name '$PROFILE' is reserved by Hermes — pick another." >&2
+    exit 1
+  fi
+done
 
 # Derived shared paths (after --shared-root is known).
 : "${SHARED_SKILLS:=${SHARED_ROOT}/skills}"
