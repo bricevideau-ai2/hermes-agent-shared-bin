@@ -26,7 +26,14 @@
 set -uo pipefail
 
 PROG=$(basename "$0")
-SERVICE="hermes-gateway.service"   # constructed, never used inside a gateway for rungs 1-3
+
+# TOPOLOGY CHANGE 2026-08-26: agents are no longer one-per-uid. Corwin
+# (default), Benedict and Deirdre ALL run as uid 1001 (videau-ai) as separate
+# Hermes PROFILES, each with its own unit:
+#   hermes-gateway.service | hermes-gateway-benedict.service | hermes-gateway-deirdre.service
+# uid is therefore NO LONGER a unique agent identifier. The unit is.
+# --unit overrides; otherwise we resolve it from the profile name.
+SERVICE="${GW_UNIT:-hermes-gateway.service}"
 
 usage() {
   cat <<EOF
@@ -89,6 +96,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="${2:-}"; shift 2 || die "--mode needs a value";;
     --mode=*) MODE="${1#*=}"; shift;;
+    --unit) SERVICE="${2:-}"; shift 2 || die "--unit needs a value";;
+    --unit=*) SERVICE="${1#*=}"; shift;;
+    --profile) SERVICE="hermes-gateway-${2:-}.service"; shift 2 || die "--profile needs a value";;
+    --profile=*) SERVICE="hermes-gateway-${1#*=}.service"; shift;;
     --dry-run) DRYRUN=1; shift;;
     --status) STATUS=1; shift;;
     -h|--help) usage; exit 0;;
@@ -110,9 +121,26 @@ THOME=$(echo "$ENT" | cut -d: -f6)
 [ -n "$TUID" ] && [ -n "$TUSER" ] || die "could not resolve target '$TARGET'"
 
 # ---- refuse self-restart (the core safety rule) ----
+# CHANGED 2026-08-26: uid is no longer a unique agent id (3 profiles share uid
+# 1001), so a uid-only comparison is both WRONG WAYS:
+#   - false positive: refuses a legitimate restart of a SIBLING profile.
+#   - false negative risk: a uid match no longer proves it is *my* gateway.
+# The real question is "does this target MY unit?" -> compare the resolved unit
+# against this process's own unit, and only then fall back to uid.
 SELF_UID=$(id -u)
-if [ "$TUID" = "$SELF_UID" ]; then
-  die "refusing to restart your OWN gateway (uid $TUID). Ask your peer agent to do it — see the cross-agent-gateway-restart skill."
+SELF_UNIT=""
+if [ "${_HERMES_GATEWAY:-}" = "1" ]; then
+  # HERMES_HOME ends in /profiles/<name> for non-default profiles.
+  case "${HERMES_HOME:-}" in
+    */profiles/*) SELF_UNIT="hermes-gateway-$(basename "${HERMES_HOME}").service" ;;
+    *)            SELF_UNIT="hermes-gateway.service" ;;
+  esac
+fi
+if [ -n "$SELF_UNIT" ] && [ "$SERVICE" = "$SELF_UNIT" ]; then
+  die "refusing to restart your OWN gateway (unit $SERVICE). Ask a peer agent to do it — see the cross-agent-gateway-restart skill."
+fi
+if [ -z "$SELF_UNIT" ] && [ "$TUID" = "$SELF_UID" ]; then
+  die "refusing to restart your OWN gateway (uid $TUID, no unit context). Pass --unit to target a specific sibling profile."
 fi
 
 RUN="XDG_RUNTIME_DIR=/run/user/$TUID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$TUID/bus"
@@ -152,6 +180,22 @@ build_cmd() {
     terminate)    echo "sudo loginctl terminate-user $TUSER" ;;
   esac
 }
+
+# ---- BLAST-RADIUS GUARD (added 2026-08-26) ----
+# 'auto'/'manager' cycle the whole user@<uid> manager, and 'terminate' kills the
+# entire user session. When ONE uid hosts several agents (piment: Corwin,
+# Benedict, Deirdre all on uid 1001) those modes take down EVERY sibling
+# gateway, not just the target. Require an explicit opt-in.
+SIBLINGS=$(sudo -u "$TUSER" env $RUN systemctl --user list-units --type=service --no-legend 2>/dev/null \
+           | grep -c -o 'hermes-gateway[^ ]*\.service' || echo 0)
+if [ "${SIBLINGS:-0}" -gt 1 ] && { [ "$MODE" = "auto" ] || [ "$MODE" = "manager" ] || [ "$MODE" = "terminate" ]; }; then
+  if [ "${GW_ALLOW_COLLATERAL:-0}" != "1" ]; then
+    die "mode '$MODE' would restart the whole user manager for uid $TUID, which currently hosts $SIBLINGS Hermes gateways -- ALL of them would be killed, not just $SERVICE.
+Use '--mode service --unit <unit>' from a shell where _HERMES_GATEWAY is unset (targets one unit only),
+or re-run with GW_ALLOW_COLLATERAL=1 if taking every sibling agent down is genuinely intended."
+  fi
+  info "WARNING: GW_ALLOW_COLLATERAL=1 -- restarting $SIBLINGS sibling gateways on uid $TUID."
+fi
 
 # ---- guard: refuse the 'service' mode when running inside a gateway ----
 if [ "$MODE" = "service" ] && [ "${_HERMES_GATEWAY:-}" = "1" ]; then
