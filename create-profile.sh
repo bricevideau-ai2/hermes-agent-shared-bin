@@ -297,6 +297,30 @@ else
   ok "created profile '$PROFILE'"
 fi
 
+# Launcher alias: ~/.local/bin/<id> -> `hermes -p <id>`.
+#
+# `hermes profile create` makes this by default, but it writes the wrapper
+# using `shutil.which("hermes")`, which resolves to a BARE `hermes` when the
+# venv is not on PATH at creation time. Measured 2026-08-26: such a wrapper
+# dies with `exec: hermes: not found` under a minimal PATH (cron, systemd,
+# env -i), while a wrapper holding the absolute venv path works. Since these
+# aliases are exactly what a non-interactive job would call, rewrite the
+# wrapper to the absolute interpreter path.
+if [[ $DRY_RUN -eq 1 ]]; then
+  printf '  [dry] ensure alias %s -> %s -p %s\n' "$PROFILE" "$HERMES_BIN" "$PROFILE"
+else
+  WRAPPER="/home/${AGENT_UID_NAME}/.local/bin/${PROFILE}"
+  if asagent test -e "$WRAPPER" && ! asagent grep -q "hermes.* -p ${PROFILE}\b" "$WRAPPER" 2>/dev/null; then
+    # Something else owns this name — do NOT clobber a real binary.
+    warn "alias '${PROFILE}' exists but is not a hermes wrapper — leaving it alone"
+  else
+    printf '#!/bin/sh\nexec %s -p %s "$@"\n' "$HERMES_BIN" "$PROFILE" \
+      | asagent tee "$WRAPPER" >/dev/null && asagent chmod 755 "$WRAPPER" \
+      && ok "alias: ${WRAPPER} -> hermes -p ${PROFILE}" \
+      || warn "could not write alias ${WRAPPER}"
+  fi
+fi
+
 # Display name — presentation-only, canonical id stays lowercase.
 #
 # Hermes stores profile ids lowercase, but renders `Display (id)` in
